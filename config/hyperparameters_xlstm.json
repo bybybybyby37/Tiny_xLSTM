@@ -1,0 +1,22 @@
+{
+    "data_path": "data/full_shakespeare.txt",
+    "save_path": "output/best_xlstm.pt",
+    "split_ratio": [
+        0.6,
+        0.2,
+        0.2
+    ],
+    "block_size": 256,
+    "batch_size": 32,
+    "patience": 5,
+    "d_model": 256,
+    "n_layers": 4,
+    "dropout": 0.1,
+    "learning_rate": 0.003,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "max_iters": 10000,
+    "eval_interval": 10,
+    "eval_iters": 10,
+    "seed": 1337
+}
