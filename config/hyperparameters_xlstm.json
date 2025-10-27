@@ -12,7 +12,7 @@
     "d_model": 256,
     "n_layers": 4,
     "dropout": 0.1,
-    "learning_rate": 0.003,
+    "learning_rate": 0.001,
     "weight_decay": 0.01,
     "grad_clip": 1.0,
     "max_iters": 10000,

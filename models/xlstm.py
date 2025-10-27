@@ -2,34 +2,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class MILSTMCell(nn.Module):
+# ---------------------------------------------------------
+# Safe exponential function (prevents overflow)
+# ---------------------------------------------------------
+def exp_clamped(x, clamp=5.0):
+    return torch.exp(torch.clamp(x, min=-clamp, max=clamp))
+
+# ---------------------------------------------------------
+# sLSTM branch (standard sigmoid input gate)
+# ---------------------------------------------------------
+class SLSTMCell(nn.Module):
     """
-    Multiplicative-Integration LSTM (a simple, strong LSTM variant).
-    This is NOT the full xLSTM from the paper, but a compact xLSTM-like cell
-    that often performs better than vanilla LSTM on char-level language modeling.
+    Stable LSTM-like cell with Multiplicative Integration + LayerNorm.
+    Uses a standard sigmoid input gate.
     """
     def __init__(self, input_size: int, hidden_size: int, bias: bool = True):
         super().__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-
-        # Separate linear maps for input and hidden for MI gates
-        self.W = nn.Linear(input_size, 4 * hidden_size, bias=bias)
-        self.U = nn.Linear(hidden_size, 4 * hidden_size, bias=False)
-
-        # LayerNorm to stabilize training (xLSTM-like flavor)
-        self.ln_gates = nn.LayerNorm(4 * hidden_size)
+        self.inp = nn.Linear(input_size, 4 * hidden_size, bias=bias)
+        self.hid = nn.Linear(hidden_size, 4 * hidden_size, bias=False)
+        self.ln_g = nn.LayerNorm(4 * hidden_size)
         self.ln_c = nn.LayerNorm(hidden_size)
 
     def forward(self, x, state):
-        h, c = state  # each (B, H)
+        h, c = state
+        gx = self.inp(x)
+        gh = self.hid(h)
 
-        gates_x = self.W(x)        # (B, 4H)
-        gates_h = self.U(h)        # (B, 4H)
-
-        # multiplicative integration
-        gates = gates_x + gates_h + gates_x * gates_h
-        gates = self.ln_gates(gates)
+        # Multiplicative Integration: Wx + Uh + Wx*Uh
+        gates = gx + gh + gx * gh
+        gates = self.ln_g(gates)
 
         i, f, g, o = gates.chunk(4, dim=-1)
         i = torch.sigmoid(i)
@@ -42,66 +43,132 @@ class MILSTMCell(nn.Module):
         h = o * torch.tanh(c)
         return h, (h, c)
 
-
-class MILSTM(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float = 0.1):
+# ---------------------------------------------------------
+# mLSTM branch (exponential write gate)
+# ---------------------------------------------------------
+class MLSTMCell(nn.Module):
+    """
+    mLSTM with exponential gating for memory updates.
+    This is the key mechanism from xLSTM:
+    c_t = f * c_{t-1} + exp(i) * g
+    """
+    def __init__(self, input_size: int, hidden_size: int, bias: bool = True):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.dropout = dropout
+        self.inp = nn.Linear(input_size, 4 * hidden_size, bias=bias)
+        self.hid = nn.Linear(hidden_size, 4 * hidden_size, bias=False)
+        self.ln_g = nn.LayerNorm(4 * hidden_size)
+        self.ln_c = nn.LayerNorm(hidden_size)
 
-        self.layers = nn.ModuleList([
-            MILSTMCell(input_size if l == 0 else hidden_size, hidden_size) for l in range(num_layers)
-        ])
+    def forward(self, x, state):
+        h, c = state
+        gx = self.inp(x)
+        gh = self.hid(h)
+
+        gates = gx + gh + gx * gh
+        gates = self.ln_g(gates)
+
+        i, f, g, o = gates.chunk(4, dim=-1)
+        f = torch.sigmoid(f)
+        o = torch.sigmoid(o)
+        g = torch.tanh(g)
+
+        # Exponential memory write strength
+        write = exp_clamped(i)
+        c = f * c + write * g
+        c = self.ln_c(c)
+        h = o * torch.tanh(c)
+        return h, (h, c)
+
+# ---------------------------------------------------------
+# xLSTM Block: parallel (sLSTM + mLSTM) + learnable fusion + residual
+# ---------------------------------------------------------
+class XLSTMBlock(nn.Module):
+    """
+    Each block:
+    - PreNorm input
+    - Run through sLSTM and mLSTM in parallel
+    - Fuse their outputs using a learnable gate
+    - Apply residual connection
+    """
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.s_cell = SLSTMCell(d_model, d_model)
+        self.m_cell = MLSTMCell(d_model, d_model)
+        self.prenorm = nn.LayerNorm(d_model)
+        self.fusion = nn.Linear(2 * d_model, d_model)
         self.drop = nn.Dropout(dropout)
 
+    def forward(self, x_t, state):
+        (hs, cs), (hm, cm) = state
+        xt = self.prenorm(x_t)
+
+        hs, (hs, cs) = self.s_cell(xt, (hs, cs))
+        hm, (hm, cm) = self.m_cell(xt, (hm, cm))
+
+        # Learnable fusion between s-stream and m-stream
+        alpha = torch.sigmoid(self.fusion(torch.cat([hs, hm], dim=-1)))
+        out = alpha * hs + (1 - alpha) * hm
+        out = self.drop(out)
+
+        # Residual
+        y = x_t + out
+        return y, ((hs, cs), (hm, cm))
+
+    def init_state(self, batch, d_model, device):
+        z = torch.zeros(batch, d_model, device=device)
+        return ((z, z.clone()), (z.clone(), z.clone()))
+
+# ---------------------------------------------------------
+# Stacked xLSTM backbone
+# ---------------------------------------------------------
+class XLSTMBackbone(nn.Module):
+    """
+    Stacked xLSTM blocks, time-unrolled inside forward().
+    """
+    def __init__(self, d_model: int, n_layers: int, dropout: float = 0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([XLSTMBlock(d_model, dropout) for _ in range(n_layers)])
+        self.norm = nn.LayerNorm(d_model)
+
     def forward(self, x, state=None):
-        """
-        x: (B, T, C_in)
-        state: list of tuples (h, c) for each layer, each (B, H)
-        returns:
-            y: (B, T, H), new_state
-        """
         B, T, C = x.shape
+        device = x.device
+
         if state is None:
-            state = [
-                (x.new_zeros(B, self.hidden_size), x.new_zeros(B, self.hidden_size))
-                for _ in range(self.num_layers)
-            ]
+            state = [layer.init_state(B, C, device) for layer in self.layers]
 
         outputs = []
         for t in range(T):
             inp = x[:, t, :]
             new_state = []
-            for l, cell in enumerate(self.layers):
-                h, c = state[l]
-                h, (h, c) = cell(inp, (h, c))
-                inp = h if l == self.num_layers - 1 else self.drop(h)  # dropout on inter-layer
-                new_state.append((h, c))
+            for l, layer in enumerate(self.layers):
+                inp, st = layer(inp, state[l])
+                new_state.append(st)
             state = new_state
             outputs.append(inp)
 
-        y = torch.stack(outputs, dim=1)  # (B, T, H)
+        y = torch.stack(outputs, dim=1)
+        y = self.norm(y)
         return y, state
 
-
+# ---------------------------------------------------------
+# Full Language Model with xLSTM backbone
+# ---------------------------------------------------------
 class XLSTMLM(nn.Module):
-    """Character LM on top of MILSTM backbone."""
+    """
+    Token embedding → xLSTM backbone → linear head → logits
+    """
     def __init__(self, vocab_size: int, d_model: int, n_layers: int, block_size: int, dropout: float = 0.1):
         super().__init__()
         self.block_size = block_size
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        # RNNs don't need positions; keep it simple.
-        self.backbone = MILSTM(d_model, d_model, n_layers, dropout=dropout)
-        self.ln_f = nn.LayerNorm(d_model)
+        self.backbone = XLSTMBackbone(d_model, n_layers, dropout)
         self.head = nn.Linear(d_model, vocab_size)
 
     def forward(self, idx, targets=None, state=None):
-        # idx: (B, T)
-        x = self.token_emb(idx)  # (B, T, d_model)
-        y, state = self.backbone(x, state=state)  # (B, T, d_model)
-        y = self.ln_f(y)
-        logits = self.head(y)    # (B, T, V)
+        x = self.token_emb(idx)
+        y, state = self.backbone(x, state=state)
+        logits = self.head(y)
 
         loss = None
         if targets is not None:
@@ -114,18 +181,17 @@ class XLSTMLM(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens=200, temperature=1.0, top_k=None):
         self.eval()
-        B = idx.size(0)
         state = None
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.block_size:]
-            x = self.token_emb(idx_cond)  # (B, T, C)
-            y, state = self.backbone(x, state=state)  # keep state for efficiency
-            last = self.ln_f(y[:, -1, :])             # (B, C)
-            logits = self.head(last) / max(1e-6, temperature)  # (B, V)
+            x = self.token_emb(idx_cond)
+            y, state = self.backbone(x, state=state)
+            last = y[:, -1, :]
+            logits = self.head(last) / max(temperature, 1e-6)
             if top_k is not None:
                 v, _ = torch.topk(logits, k=top_k, dim=-1)
                 logits[logits < v[:, [-1]]] = -float("inf")
             probs = torch.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            next_id = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_id], dim=1)
         return idx
