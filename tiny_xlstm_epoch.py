@@ -6,6 +6,7 @@ import numpy as np
 from types import SimpleNamespace
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import Dataset, DataLoader
 
 from models import tokenizer
 from models.xlstm import XLSTMLM
@@ -21,6 +22,8 @@ split_ratio = tuple(cfg.split_ratio)
 block_size = cfg.block_size
 batch_size = cfg.batch_size
 patience = cfg.patience
+num_epochs = cfg.eval_interval  
+stride_overlap_ratio = cfg.stride_overlap_ratio
 
 d_model = cfg.d_model
 n_layers = cfg.n_layers
@@ -99,15 +102,48 @@ test_data = data[n_train + n_val:]
 print(f"Total tokens: {n:,}")
 print(f"Train: {len(train_data):,}, Val: {len(val_data):,}, Test: {len(test_data):,}")
 
-def get_batch(split):
-    data_split = {"train": train_data, "val": val_data, "test": test_data}[split]
-    ix = torch.randint(0, len(data_split) - block_size - 1, (batch_size,))
-    x = torch.stack([data_split[i     : i + block_size]     for i in ix])
-    y = torch.stack([data_split[i + 1 : i + 1 + block_size] for i in ix])
-    return x.to(device), y.to(device)
+class CharDataset(Dataset):
+    def __init__(self, data_tensor, block_size, stride=1):
+        self.data = data_tensor
+        self.block_size = block_size
+        self.stride = stride
+        self.n_samples = (len(self.data) - self.block_size) // self.stride + 1
 
-xb, yb = get_batch("train")
-print(xb.shape, yb.shape)
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        data_idx = idx * self.stride
+        
+
+        if data_idx + self.block_size + 1 > len(self.data):
+            pass
+
+        x = self.data[data_idx : data_idx + self.block_size]
+        y = self.data[data_idx + 1 : data_idx + self.block_size + 1]
+        return x, y
+# define the stride ratio    
+my_stride = int (block_size * stride_overlap_ratio)
+
+train_dataset = CharDataset(train_data, block_size, stride=my_stride)
+val_dataset = CharDataset(val_data, block_size, stride=block_size)
+test_dataset = CharDataset(test_data, block_size, stride=block_size)
+
+train_loader = DataLoader(
+    train_dataset, 
+    batch_size=batch_size, 
+    shuffle=True, 
+)
+val_loader = DataLoader(
+    val_dataset, 
+    batch_size=batch_size, 
+    shuffle=False, 
+)
+test_loader = DataLoader(
+    test_dataset, 
+    batch_size=batch_size, 
+    shuffle=False, 
+)
 
 # Model
 class MiniXLSTMLM(nn.Module):
@@ -125,10 +161,10 @@ class MiniXLSTMLM(nn.Module):
 
 model = MiniXLSTMLM().to(device)
 
-# 尝试添加这一行
+# boost the training
 if torch.__version__.startswith("2"):
     print("Compiling model...")
-    model = torch.compile(model) # <--- 就是这行
+    model = torch.compile(model) 
     
 print("Params:", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
@@ -143,74 +179,86 @@ bad_epochs = 0
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
 
-# 1. 初始化 GradScaler
 scaler = torch.cuda.amp.GradScaler()
 
 @torch.no_grad()
-def estimate_loss(split):
+def estimate_loss(loader): 
     model.eval()
     losses = []
-    for _ in range(eval_iters):
-        xb, yb = get_batch(split)
+
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device) 
         _, loss = model(xb, yb)
         losses.append(loss.item())
     model.train()
-    return sum(losses) / len(losses)
+    return sum(losses) / len(losses) 
 
-for step in range(1, max_iters + 1):
-    xb, yb = get_batch("train")
+global_step = 0 
 
-    # 2. 将前向传播包裹在 autocast 中
-    with torch.cuda.amp.autocast():
-        _, loss = model(xb, yb)
+print(f"Starting training for {num_epochs} epochs...")
 
-    optimizer.zero_grad(set_to_none=True)
+for epoch in range(1, num_epochs + 1):
+    print(f"--- Epoch {epoch}/{num_epochs} ---")
+    model.train()
+
+  
+    for i, (xb, yb) in enumerate(train_loader):
+        global_step += 1
+        xb, yb = xb.to(device), yb.to(device) 
+
+        with torch.cuda.amp.autocast():
+            _, loss = model(xb, yb)
+
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+
+        if i % 100 == 0:
+             print(f"Epoch {epoch} | Step {i}/{len(train_loader)} | Train Loss {loss.item():.4f}")
+        writer.add_scalar("loss/train", loss.item(), global_step)
+
+    # validation after each epoch
+    print(f"Epoch {epoch} complete. Running validation...")
+    val_loss = estimate_loss(val_loader) 
     
-    # 3. 使用 scaler 来反向传播
-    scaler.scale(loss).backward()
+    print(f"Epoch {epoch} | val_loss {val_loss:.4f} | LR {optimizer.param_groups[0]['lr']:.6f}")
     
-    # 4. 在 clip_grad_norm_ 之前 unscale 梯度
-    scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    scheduler.step(val_loss) 
     
-    # 5. 使用 scaler.step() 来更新权重
-    scaler.step(optimizer)
-    
-    # 6. 更新 scaler
-    scaler.update()
+    writer.add_scalar("loss/val", val_loss, global_step)
+    writer.add_scalar("epoch", epoch, global_step)
+    writer.add_scalar("lr", optimizer.param_groups[0]['lr'], global_step)
 
-    writer.add_scalar("loss/train", loss.item(), step)
+    if val_loss < best_val:
+        best_val = val_loss
+        bad_epochs = 0
+        torch.save({
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch, 
+            "best_val": best_val,
+        }, save_path)
+        print(f"improved! best_val={best_val:.4f} (saved)")
+    else:
+        bad_epochs += 1
+        print(f"no improvement ({bad_epochs}/{patience})")
+        if bad_epochs >= patience:
+            print("early stopping triggered.")
+            break 
 
-    if step % eval_interval == 0 or step == 1:
-        val_loss = estimate_loss("val")
-        print(f"step {step:4d} | train_loss {loss.item():.4f} | val_loss {val_loss:.4f}")
-        scheduler.step(val_loss)
-        writer.add_scalar("loss/val", val_loss, step)
-        writer.add_scalar("lr", optimizer.param_groups[0]['lr'], step)
-
-        if val_loss < best_val:
-            best_val = val_loss
-            bad_epochs = 0
-            torch.save({
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "step": step,
-                "best_val": best_val,
-            }, save_path)
-            print(f"improved! best_val={best_val:.4f} (saved)")
-        else:
-            bad_epochs += 1
-            print(f"no improvement ({bad_epochs}/{patience})")
-            if bad_epochs >= patience:
-                print("early stopping triggered.")
-                break
+# final test evaluation starts here
+print("Training finished. Loading best model for final evaluation...")
 
 @torch.no_grad()
 def evaluate_test_set():
     model.eval()
     losses = []
-    for _ in range(1000):       # edited
-        xb, yb = get_batch("test")
+
+    for xb, yb in test_loader:
+        xb, yb = xb.to(device), yb.to(device)
         _, loss = model(xb, yb)
         losses.append(loss.item())
     test_loss = sum(losses) / len(losses)
@@ -219,7 +267,7 @@ def evaluate_test_set():
 checkpoint = torch.load(save_path, map_location=device)
 model.load_state_dict(checkpoint["model"])
 model.to(device).eval()
-print(f"Loaded best model with best_val={checkpoint['best_val']:.4f} at step={checkpoint['step']}")
+print(f"Loaded best model with best_val={checkpoint['best_val']:.4f} at epoch={checkpoint['epoch']}")
 
 with torch.no_grad():
     test_loss = evaluate_test_set()
